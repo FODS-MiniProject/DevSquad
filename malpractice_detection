@@ -1,0 +1,162 @@
+function fodsmalpractice_main()
+    % === MAIN SCRIPT ===
+    [vidFile, vidPath] = uigetfile({'*.mp4;*.avi;*.mov'}, 'Select Exam Video File');
+    if isequal(vidFile,0)
+        disp('No video selected. Exiting.');
+        return;
+    end
+    videoFullPath = fullfile(vidPath, vidFile);
+
+    moveThresh = 50;
+    lostFrameLimit = 10;
+
+    [malpracticeEvents, detectionLog] = analyze_video(videoFullPath, moveThresh, lostFrameLimit);
+    cleanedLog = clean_log(detectionLog);
+    visualize_data(cleanedLog);
+    pca_analysis(cleanedLog);
+
+    reportFile = fullfile(pwd, 'fodsmalpractice_report.xlsx');
+    writetable(cleanedLog, reportFile);
+    disp(['📄 Report saved to: ' reportFile]);
+
+    if ~isempty(malpracticeEvents)
+        disp('⚠ Malpractice suspected! Events detected:');
+        for i = 1:length(malpracticeEvents)
+            fprintf(' - Frame %d at %.2f s: %s\n', ...
+                malpracticeEvents(i).FrameNum, malpracticeEvents(i).TimeSec, malpracticeEvents(i).Reason);
+        end
+    else
+        disp('✅ No malpractice detected.');
+    end
+end
+
+%% === LOCAL FUNCTIONS ===
+
+function [events, log] = analyze_video(videoFile, moveThresh, lostFrameLimit)
+    vid = VideoReader(videoFile);
+    faceDetector = vision.CascadeObjectDetector();
+    faceLostFrames = 0;
+    previousX = [];
+    events = struct('FrameNum', {}, 'TimeSec', {}, 'Reason', {});
+    log = table([], [], [], [], 'VariableNames', {'FrameNum','TimeSec','X','FaceFound'});
+
+    fig = figure('Name','Exam Monitoring','NumberTitle','off');
+    frameNum = 0;
+    cheatingTriggered = false;
+    cheatingDisplayFrames = 0;
+    cheatingDisplayLimit = 50;
+
+    while hasFrame(vid)
+        frame = readFrame(vid);
+        frameNum = frameNum + 1;
+        bboxes = step(faceDetector, frame);
+
+        imshow(frame); hold on;
+
+        if ~isempty(bboxes)
+            currentX = bboxes(1,1);
+            faceLostFrames = 0;
+            if ~isempty(previousX)
+                dx = abs(currentX - previousX);
+                if dx > moveThresh && ~cheatingTriggered
+                    cheatingTriggered = true;
+                    events(end+1) = struct('FrameNum', frameNum, 'TimeSec', vid.CurrentTime, 'Reason', 'Large Movement');
+                    cheatingDisplayFrames = cheatingDisplayLimit;
+                end
+            end
+            previousX = currentX;
+            rectangle('Position', bboxes(1,:), 'EdgeColor', 'g', 'LineWidth', 2);
+            title('Face Detected');
+            faceFound = true;
+        else
+            faceLostFrames = faceLostFrames + 1;
+            faceFound = false;
+            if faceLostFrames >= lostFrameLimit && ~cheatingTriggered
+                cheatingTriggered = true;
+                events(end+1) = struct('FrameNum', frameNum, 'TimeSec', vid.CurrentTime, 'Reason', 'Face Lost');
+                cheatingDisplayFrames = cheatingDisplayLimit;
+            end
+            title(sprintf('No Face Detected: %d frames', faceLostFrames));
+        end
+
+        if cheatingTriggered && cheatingDisplayFrames > 0
+            text(10, 30, 'CHEATING DETECTED', ...
+                'Color', 'red', 'FontSize', 20, 'FontWeight', 'bold', ...
+                'BackgroundColor', 'yellow');
+            cheatingDisplayFrames = cheatingDisplayFrames - 1;
+        end
+
+        hold off;
+        log = [log; {frameNum, vid.CurrentTime, double(previousX), faceFound}];
+        pause(0.001 );
+
+        if ~isvalid(fig)
+            break;
+        end
+    end
+    close(fig);
+end
+
+function cleanedLog = clean_log(log)
+    maskValidX = ~isnan(log.X) & ~cellfun(@isempty, num2cell(log.X));
+    cleanedLog = log(maskValidX, :);
+    cleanedLog.X = double(cleanedLog.X(:));
+    cleanedLog.TimeSec = double(cleanedLog.TimeSec(:));
+    cleanedLog.FrameNum = double(cleanedLog.FrameNum(:));
+    cleanedLog.FaceFound = logical(cleanedLog.FaceFound);
+end
+
+function visualize_data(T)
+    T.X = double(T.X(:));
+    T.TimeSec = double(T.TimeSec(:));
+    T.FaceFound = logical(T.FaceFound);
+
+    if height(T) < 2
+        dx = zeros(height(T),1);
+    else
+        dx = [0; abs(diff(T.X))];
+    end
+
+    figure('Name','EDA','NumberTitle','off','Position',[100 100 1200 600]);
+
+    subplot(2,2,1);
+    plot(T.TimeSec, T.FaceFound, '-b', 'LineWidth', 1.5);
+    xlabel('Time (s)'); ylabel('Face Found'); title('Face Detection Over Time'); grid on;
+
+    subplot(2,2,2);
+    plot(T.TimeSec, T.X, '-r'); xlabel('Time (s)'); ylabel('X Position'); title('X Position Over Time'); grid on;
+
+    subplot(2,2,3);
+    plot(T.TimeSec, dx, '-m'); xlabel('Time (s)'); ylabel('|ΔX|'); title('Face Movement Magnitude'); grid on;
+
+    subplot(2,2,4);
+    histogram(dx, 30); xlabel('|ΔX|'); ylabel('Frequency'); title('Movement Histogram'); grid on;
+end
+
+function pca_analysis(T)
+    T.X = double(T.X(:));
+    if height(T) < 2
+        dx = zeros(height(T),1);
+    else
+        dx = [0; abs(diff(T.X))];
+    end
+
+    Xnorm = (dx - mean(dx)) ./ std(dx);
+    Ynorm = (double(T.FaceFound) - mean(T.FaceFound)) ./ std(double(T.FaceFound));
+    M = [Xnorm, Ynorm];
+
+    C = cov(M);
+    [V, D] = eig(C);
+    [eVals, idx] = sort(diag(D), 'descend');
+    eVecs = V(:, idx);
+    score = M * eVecs;
+    explained = 100 * eVals / sum(eVals);
+
+    fprintf('\nPCA Explained Variance (Manual):\n');
+    disp(explained');
+
+    figure('Name','Manual PCA','NumberTitle','off');
+    scatter(score(:,1), score(:,2), 20, T.TimeSec, 'filled');
+    colorbar;
+    xlabel('PC1'); ylabel('PC2'); title('Manual PCA Projection'); grid on;
+end
